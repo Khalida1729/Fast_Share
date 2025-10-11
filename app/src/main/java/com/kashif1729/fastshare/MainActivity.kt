@@ -3,16 +3,20 @@ package com.kashif1729.fastshare
 import android.Manifest
 import android.app.Activity
 import android.content.ContentResolver
+import android.content.ContentValues.TAG
 import android.content.Context
-//import android.content.Intent
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
-//import android.net.wifi.p2p.WifiP2pManager
-//import android.os.Build
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
-//import android.provider.Settings
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,8 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-//import androidx.core.app.ActivityCompat
-//import androidx.core.app.ActivityCompat.requestPermissions
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -46,8 +49,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.*
 import java.net.*
-import java.text.DateFormat.getDateInstance
-import java.text.DateFormat.getTimeInstance
+import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -83,7 +85,6 @@ enum class MessageType {
 
 enum class ConnectionType {
     OFFLINE, LOCAL_WIFI
-//    WIFI_DIRECT, INTERNET
 }
 
 // ConnectionManager
@@ -96,7 +97,63 @@ class ConnectionManager(private val context: Context) {
     private var receiverJob: Job? = null
     private var serverSocket: ServerSocket? = null
 
+    // Android Networking Components
+    private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            super.onAvailable(network)
+            Log.d(TAG, "Network available")
+            updateConnectionStatus()
+        }
+
+        override fun onLost(network: Network) {
+            super.onLost(network)
+            Log.d(TAG, "Network lost")
+            _currentConnection.value = ConnectionStatus()
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            super.onCapabilitiesChanged(network, networkCapabilities)
+            updateConnectionStatus()
+        }
+    }
+
+    init {
+        registerNetworkCallback()
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val networkRequest = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+
+            connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+            Log.d(TAG, "Network callback registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register network callback", e)
+        }
+    }
+    var localIp = ""
+    private suspend fun K (){
+
+        localIp = getLocalIpAddress()
+    }
+    private fun updateConnectionStatus() {
+        val currentNetwork = connectivityManager.activeNetwork
+        val capabilities = connectivityManager.getNetworkCapabilities(currentNetwork)
+
+        val isWifi = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+
+
+        _currentConnection.value = _currentConnection.value.copy(
+            localIp = localIp,
+            connectionType = if (isWifi) ConnectionType.LOCAL_WIFI else ConnectionType.OFFLINE
+        )
+    }
 
     fun startReceiver() {
         stopReceiver()
@@ -117,7 +174,11 @@ class ConnectionManager(private val context: Context) {
                 while (isActive) {
                     val socket = serverSocket!!.accept()
                     Log.d(TAG, "Incoming connection from ${socket.inetAddress.hostAddress}")
-                    handleIncomingConnection(socket)
+
+                    // Handle connection in separate coroutine
+                    launch {
+                        handleIncomingConnection(socket)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Receiver error", e)
@@ -153,7 +214,7 @@ class ConnectionManager(private val context: Context) {
                 if (isLocalConnectionPossible(contact)) {
                     sendViaLocalNetwork(contact, fileUri)
                 } else {
-                    false // Internet transfer not implemented yet
+                    false
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Send failed", e)
@@ -165,6 +226,7 @@ class ConnectionManager(private val context: Context) {
     suspend fun sendMessage(contact: Contact, message: String): Boolean {
         return withContext(Dispatchers.IO) {
             try {
+                K()
                 val socket = Socket(contact.ipAddress, 8989)
                 val outputStream = socket.getOutputStream()
                 val writer = PrintWriter(outputStream, true)
@@ -192,7 +254,6 @@ class ConnectionManager(private val context: Context) {
                 val inputStream = socket.getInputStream()
                 val reader = BufferedReader(InputStreamReader(inputStream))
 
-                // Read header
                 val header = reader.readLine()
                 Log.d(TAG, "Received header: $header")
 
@@ -218,12 +279,31 @@ class ConnectionManager(private val context: Context) {
 
     private fun handleIncomingMessage(senderIp: String, message: String) {
         Log.d(TAG, "Message from $senderIp: $message")
-        // This would typically update the chat UI via ChatManager
+        // Update chat UI via ChatManager
     }
 
     private fun handleIncomingFile(socket: Socket, fileName: String, reader: BufferedReader) {
-        // Implement file receiving logic
-        Log.d(TAG, "File received: $fileName")
+        try {
+            // Create downloads directory if not exists
+            val downloadsDir = File(context.getExternalFilesDir(null), "FastShare")
+            if (!downloadsDir.exists()) {
+                downloadsDir.mkdirs()
+            }
+
+            val file = File(downloadsDir, fileName)
+            FileOutputStream(file).use { outputStream ->
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+
+                while (reader.read().also { bytesRead = it } != -1) {
+                    outputStream.write(bytesRead)
+                }
+            }
+
+            Log.d(TAG, "File saved: ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving file", e)
+        }
     }
 
     private suspend fun sendViaLocalNetwork(contact: Contact, fileUri: Uri): Boolean {
@@ -234,17 +314,25 @@ class ConnectionManager(private val context: Context) {
                 val writer = PrintWriter(outputStream, true)
 
                 val fileName = getFileName(context.contentResolver, fileUri)
+                val fileStream = context.contentResolver.openInputStream(fileUri)
 
                 // Send file header
                 writer.println("FILE:$fileName")
 
-                // Here you would read the file and send its content
-                // For now, we'll just send a placeholder
-                writer.println("FILE_CONTENT_PLACEHOLDER")
+                // Send file content
+                fileStream?.use { inputStream ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                    }
+                }
 
                 writer.close()
                 outputStream.close()
                 socket.close()
+                fileStream?.close()
 
                 Log.d(TAG, "File sent to ${contact.ipAddress}")
                 true
@@ -257,7 +345,6 @@ class ConnectionManager(private val context: Context) {
 
     private fun isLocalConnectionPossible(contact: Contact): Boolean {
         return try {
-            // Simple check - try to resolve the IP
             InetAddress.getByName(contact.ipAddress).isReachable(1000)
         } catch (e: Exception) {
             false
@@ -266,28 +353,33 @@ class ConnectionManager(private val context: Context) {
 
     private suspend fun getLocalIpAddress(): String = withContext(Dispatchers.IO) {
         try {
-            val wifiInfo = wifiManager.connectionInfo
-            val ip = wifiInfo.ipAddress
-            "${ip and 0xFF}.${ip shr 8 and 0xFF}.${ip shr 16 and 0xFF}.${ip shr 24 and 0xFF}"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // Use ConnectivityManager for Android 11+
+                val currentNetwork = connectivityManager.activeNetwork
+                val linkProperties = connectivityManager.getLinkProperties(currentNetwork)
+                linkProperties?.linkAddresses?.firstOrNull { addr ->
+                    addr.address is Inet4Address && !addr.address.isLoopbackAddress
+                }?.address?.hostAddress ?: ""
+            } else {
+                // Fallback for older versions
+                val wifiInfo = wifiManager.connectionInfo
+                val ip = wifiInfo.ipAddress
+                "${ip and 0xFF}.${ip shr 8 and 0xFF}.${ip shr 16 and 0xFF}.${ip shr 24 and 0xFF}"
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error getting local IP", e)
-            try {
-                NetworkInterface.getNetworkInterfaces().toList().forEach { intf ->
-                    intf.inetAddresses.toList().forEach { addr ->
-                        if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                            return@withContext addr.hostAddress ?: ""
-                        }
-                    }
-                }
-                ""
-            } catch (e2: Exception) {
-                ""
-            }
+            ""
         }
     }
 
     fun cleanup() {
         stopReceiver()
+        try {
+            connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering network callback", e)
+        }
     }
 }
 
@@ -480,6 +572,53 @@ private fun getFileName(contentResolver: ContentResolver, uri: Uri): String {
     return "unknown_file"
 }
 
+// Permission helpers with Android version checks
+private fun hasRequiredPermissions(context: Context): Boolean {
+    val basePermissions = arrayOf(
+        Manifest.permission.ACCESS_WIFI_STATE,
+        Manifest.permission.CHANGE_WIFI_STATE,
+        Manifest.permission.ACCESS_NETWORK_STATE,
+        Manifest.permission.INTERNET
+    ).toMutableList()
+
+    // Add storage permissions for older Android versions
+    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
+        basePermissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        basePermissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
+
+    // Add nearby devices permission for Android 12+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        basePermissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+    }
+
+    return basePermissions.all { permission ->
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+private fun getRequiredPermissions(): Array<String> {
+    val permissions = mutableListOf(
+        Manifest.permission.ACCESS_WIFI_STATE,
+        Manifest.permission.CHANGE_WIFI_STATE,
+        Manifest.permission.ACCESS_NETWORK_STATE,
+        Manifest.permission.INTERNET
+    )
+
+    // Add storage permissions for older Android versions
+    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
+        permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
+
+    // Add nearby devices permission for Android 12+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+    }
+
+    return permissions.toTypedArray()
+}
+
 // Main Activity
 class MainActivity : ComponentActivity() {
     private val TAG = "FastSharePro"
@@ -534,10 +673,14 @@ fun FastShareProApp(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions.all { it.value }) {
+        val allGranted = permissions.all { it.value }
+        if (allGranted) {
             scope.launch {
                 connectionManager.startReceiver()
             }
+        } else {
+            // Handle permission denial
+            Log.w(TAG, "Some permissions were not granted")
         }
     }
 
@@ -584,7 +727,7 @@ fun FastShareProApp(
             )
         },
         bottomBar = {
-            NavigationBar { 
+            NavigationBar {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
@@ -713,14 +856,7 @@ fun FastShareProApp(
         if (hasRequiredPermissions(context)) {
             connectionManager.startReceiver()
         } else {
-            permissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_WIFI_STATE,
-                    Manifest.permission.CHANGE_WIFI_STATE,
-                    Manifest.permission.ACCESS_NETWORK_STATE,
-                    Manifest.permission.INTERNET
-                )
-            )
+            permissionLauncher.launch(getRequiredPermissions())
         }
     }
 }
@@ -735,118 +871,76 @@ fun ChatScreen(
     var messageText by remember { mutableStateOf("") }
     val selectedContact = contacts.find { it.isSelected }
 
+    // Chat Area
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+    ) {
+        if (selectedContact != null) {
+            // Fixed Header with Contact Name
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp)
+                    .background(MaterialTheme.colorScheme.primary)
+                    .padding(horizontal = 16.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Text(
+                    text = selectedContact.name,
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = MaterialTheme.colorScheme.onPrimary
+                )
+            }
 
-        // Chat Area
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-        ) {
-            if (selectedContact != null) {
-                // Fixed Header with Contact Name
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(64.dp)
-                        .background(MaterialTheme.colorScheme.primary)
-                        .padding(horizontal = 16.dp),
-                    contentAlignment = Alignment.CenterStart
-                ) {
-                    Text(
-                        text = selectedContact.name,
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.onPrimary
-                    )
+            // Messages Area with proper spacing
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(messages) { message ->
+                    MessageBubble(message = message)
                 }
+            }
 
-                // Messages Area with proper spacing
-                LazyColumn(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(messages) { message ->
-                        MessageBubble(message = message)
-                    }
-                }
-
-                // Message Input
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = messageText,
-                        onValueChange = { messageText = it },
-                        placeholder = { Text("Type a message...") },
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    IconButton(
-                        onClick = {
-                            if (messageText.isNotBlank()) {
-                                onSendMessage(messageText)
-                                messageText = ""
-                            }
+            // Message Input
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = messageText,
+                    onValueChange = { messageText = it },
+                    placeholder = { Text("Type a message...") },
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(
+                    onClick = {
+                        if (messageText.isNotBlank()) {
+                            onSendMessage(messageText)
+                            messageText = ""
                         }
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, "Send Message")
                     }
-                }
-            } else {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
                 ) {
-                    Text("Select a contact to start chatting", style = MaterialTheme.typography.bodyLarge)
+                    Icon(Icons.AutoMirrored.Filled.Send, "Send Message")
                 }
+            }
+        } else {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Select a contact to start chatting", style = MaterialTheme.typography.bodyLarge)
             }
         }
     }
-
-//@Composable
-//fun ContactListItem(contact: Contact, isSelected: Boolean, onClick: () -> Unit) {
-//    Card(
-//        modifier = Modifier
-//            .fillMaxWidth()
-//            .padding(8.dp),
-//        colors = CardDefaults.cardColors(
-//            containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer
-//            else MaterialTheme.colorScheme.surface
-//        ),
-//        onClick = onClick
-//    ) {
-//        Row(
-//            modifier = Modifier.padding(16.dp),
-//            verticalAlignment = Alignment.CenterVertically
-//        ) {
-//            Box(
-//                modifier = Modifier
-//                    .size(40.dp)
-//                    .background(MaterialTheme.colorScheme.primary, CircleShape),
-//                contentAlignment = Alignment.Center
-//            ) {
-//                Text(
-//                    text = contact.name.take(2).uppercase(),
-//                    color = Color.White,
-//                    fontWeight = FontWeight.Bold
-//                )
-//            }
-//            Spacer(modifier = Modifier.width(12.dp))
-//            Column {
-//                Text(contact.name, fontWeight = FontWeight.Bold)
-//                Text(contact.ipAddress, style = MaterialTheme.typography.bodySmall)
-//                Text(
-//                    "Last seen: ${getTimeInstance().format(contact.lastSeen)}",
-//                    style = MaterialTheme.typography.bodySmall
-//                )
-//            }
-//        }
-//    }
-//}
+}
 
 @Composable
 fun MessageBubble(message: ChatMessage) {
@@ -876,7 +970,7 @@ fun MessageBubble(message: ChatMessage) {
                     }
                 }
                 Text(
-                    text = getTimeInstance().format(message.timestamp),
+                    text = DateFormat.getTimeInstance().format(message.timestamp),
                     style = MaterialTheme.typography.labelSmall
                 )
             }
@@ -982,7 +1076,7 @@ fun ContactListItemWithDelete(
                 Text(contact.name, fontWeight = FontWeight.Bold)
                 Text(contact.ipAddress, style = MaterialTheme.typography.bodySmall)
                 Text(
-                    "Last seen: ${getTimeInstance().format(contact.lastSeen)}",
+                    "Last seen: ${DateFormat.getTimeInstance().format(contact.lastSeen)}",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -997,12 +1091,12 @@ fun ContactListItemWithDelete(
         }
     }
 }
+
 @Composable
 fun SettingsScreen(
     connectionManager: ConnectionManager,
     contactManager: ContactManager
 ) {
-    //val context = LocalContext.current
     val currentConnection by connectionManager.currentConnection.collectAsState()
 
     Column(
@@ -1052,39 +1146,3 @@ fun SettingsScreen(
         }
     }
 }
-
-// Permission helpers
-private fun hasRequiredPermissions(context: Context): Boolean {
-    val permissions = arrayOf(
-        Manifest.permission.ACCESS_WIFI_STATE,
-        Manifest.permission.CHANGE_WIFI_STATE,
-        Manifest.permission.ACCESS_NETWORK_STATE,
-        Manifest.permission.INTERNET,
-        Manifest.permission.WRITE_EXTERNAL_STORAGE,
-        Manifest.permission.READ_EXTERNAL_STORAGE,
-        Manifest.permission.NEARBY_WIFI_DEVICES
-    )
-
-    return permissions.all {
-        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-    }
-}
-
-//private fun requestPermissions(launcher: ActivityResultContracts.RequestMultiplePermissions) {
-//    val permissions = mutableListOf(
-//        Manifest.permission.ACCESS_WIFI_STATE,
-//        Manifest.permission.CHANGE_WIFI_STATE,
-//        Manifest.permission.ACCESS_NETWORK_STATE,
-//        Manifest.permission.INTERNET
-//    )
-//
-//    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
-//        permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-//        permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-//    }
-//
-//    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-//        permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-//    }
-//
-//    launcher.launch(permissions.toTypedArray())
